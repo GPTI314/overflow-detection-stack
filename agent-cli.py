@@ -13,7 +13,16 @@ Usage:
     agent heartbeat               Trigger immediate collection cycle
     agent findings                Show security findings (MITRE + audit)
     agent capture [opts]          On-demand packet capture + analysis
+    agent vault [subcmd]          Secret management (dual-layer vault)
     agent help                    Show this help
+
+Vault commands:
+    agent vault list                          List all secrets (key, category, notes)
+    agent vault store <key> [--generate N]    Store secret (stdin or auto-generate)
+    agent vault reveal <key>                  Decrypt and print
+    agent vault rotate <key> [--hook "cmd"]   Generate new, store, run post-hook
+    agent vault check                         Find plaintext secrets outside vault
+    agent vault audit [key]                   Show access log
 
 Capture options:
     agent capture --duration 60                 Capture 60s on all interfaces
@@ -269,6 +278,235 @@ def cmd_heartbeat():
     cmd_scan()
 
 
+# --- Vault ---
+
+VAULT_API = "http://127.0.0.1:8486/api/secrets"
+AIRLOCK_KEY_FILE = Path.home() / ".automagpt/sovereign_key"
+
+
+def _vault_headers() -> dict:
+    """Get auth headers for vault API."""
+    key = ""
+    if AIRLOCK_KEY_FILE.exists():
+        key = AIRLOCK_KEY_FILE.read_text().strip()
+    return {"X-Airlock-Key": key, "Content-Type": "application/json"}
+
+
+def _vault_request(method: str, path: str, data: dict | None = None) -> dict:
+    """Make an authenticated request to the vault API."""
+    import urllib.request
+    url = f"{VAULT_API}{path}"
+    body = json.dumps(data).encode() if data else None
+    req = urllib.request.Request(url, data=body, headers=_vault_headers(), method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return {"error": f"HTTP {e.code}", "detail": e.read().decode()[:200]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def cmd_vault(args):
+    """Secret management — dual-layer vault interface."""
+    if not args:
+        print("Usage: agent vault <list|store|reveal|rotate|check|audit>")
+        return
+
+    subcmd = args[0]
+    rest = args[1:]
+
+    if subcmd == "list":
+        result = _vault_request("GET", "")
+        secrets = result.get("secrets", [])
+        if not secrets:
+            print("  (no secrets stored)")
+            return
+        print(f"{'Key':<35} {'Category':<15} {'Notes'}")
+        print("-" * 80)
+        for s in secrets:
+            print(f"{s['key']:<35} {s.get('category',''):<15} {s.get('notes','')[:40]}")
+
+    elif subcmd == "store":
+        if not rest:
+            print("Usage: agent vault store <key> [--generate N] [--category CAT] [--notes NOTES]")
+            return
+        key = rest[0]
+        category = "general"
+        notes = ""
+        generate = 0
+
+        # Parse flags
+        i = 1
+        while i < len(rest):
+            if rest[i] == "--generate" and i + 1 < len(rest):
+                generate = int(rest[i + 1])
+                i += 2
+            elif rest[i] == "--category" and i + 1 < len(rest):
+                category = rest[i + 1]
+                i += 2
+            elif rest[i] == "--notes" and i + 1 < len(rest):
+                notes = rest[i + 1]
+                i += 2
+            else:
+                i += 1
+
+        if generate > 0:
+            import base64
+            value = base64.b64encode(os.urandom(generate)).decode()
+            print(f"Generated {generate}-byte random value")
+        else:
+            print(f"Enter secret value for '{key}' (then Ctrl+D):")
+            value = sys.stdin.read().strip()
+            if not value:
+                print("Empty value, aborting.")
+                return
+
+        result = _vault_request("POST", f"/{key}", {
+            "value": value,
+            "category": category,
+            "notes": notes,
+        })
+        if result.get("status") == "stored":
+            print(f"Stored: {key} [{category}]")
+        else:
+            print(f"Error: {result}")
+
+    elif subcmd == "reveal":
+        if not rest:
+            print("Usage: agent vault reveal <key>")
+            return
+        key = rest[0]
+        result = _vault_request("GET", f"/{key}/reveal")
+        if "value" in result:
+            print(result["value"])
+        else:
+            print(f"Error: {result}")
+
+    elif subcmd == "rotate":
+        if not rest:
+            print("Usage: agent vault rotate <key> [--bytes N] [--hook 'command']")
+            return
+        key = rest[0]
+        byte_count = 32
+        hook = None
+
+        i = 1
+        while i < len(rest):
+            if rest[i] == "--bytes" and i + 1 < len(rest):
+                byte_count = int(rest[i + 1])
+                i += 2
+            elif rest[i] == "--hook" and i + 1 < len(rest):
+                hook = rest[i + 1]
+                i += 2
+            else:
+                i += 1
+
+        # Get existing metadata
+        existing = _vault_request("GET", "")
+        meta = {}
+        for s in existing.get("secrets", []):
+            if s["key"] == key:
+                meta = s
+                break
+
+        # Generate new value
+        import base64
+        new_value = base64.b64encode(os.urandom(byte_count)).decode()
+
+        # Store
+        result = _vault_request("POST", f"/{key}", {
+            "value": new_value,
+            "category": meta.get("category", "general"),
+            "notes": meta.get("notes", ""),
+        })
+
+        if result.get("status") != "stored":
+            print(f"Failed to store: {result}")
+            return
+
+        print(f"Rotated: {key} ({byte_count} bytes)")
+
+        # Run post-hook if specified
+        if hook:
+            # Replace {value} placeholder in hook command
+            hook_cmd = hook.replace("{value}", new_value)
+            print(f"Running hook: {hook_cmd[:60]}...")
+            try:
+                r = subprocess.run(hook_cmd, shell=True, capture_output=True, text=True, timeout=30)
+                if r.returncode == 0:
+                    print(f"Hook succeeded")
+                else:
+                    print(f"Hook failed (exit {r.returncode}): {r.stderr[:100]}")
+            except Exception as e:
+                print(f"Hook error: {e}")
+
+    elif subcmd == "check":
+        # Scan for plaintext secrets outside vault
+        print("Scanning for plaintext secrets outside vault...")
+        patterns = [
+            "PASSWORD=", "SECRET=", "TOKEN=", "API_KEY=",
+            "PRIVATE_KEY", "-----BEGIN", "secret_key",
+        ]
+        scan_paths = [
+            "/etc/agent-monitor/",
+            "/opt/pihole/",
+            "/opt/lgp/",
+            "/root/kvm4/",
+        ]
+        findings = []
+        for scan_path in scan_paths:
+            p = Path(scan_path)
+            if not p.exists():
+                continue
+            for f in p.rglob("*"):
+                if not f.is_file():
+                    continue
+                if f.suffix in (".pyc", ".sqlite", ".db", ".prom", ".json"):
+                    continue
+                if f.stat().st_size > 1_000_000:  # skip files > 1MB
+                    continue
+                try:
+                    content = f.read_text(errors="ignore")
+                    for pat in patterns:
+                        if pat in content:
+                            # Check it's not just a comment or vault reference
+                            for line_no, line in enumerate(content.splitlines(), 1):
+                                if pat in line and not line.strip().startswith("#") and "vault" not in line.lower():
+                                    findings.append(f"  {f}:{line_no} — contains '{pat}'")
+                                    break
+                            break
+                except Exception:
+                    continue
+
+        if findings:
+            print(f"\n{len(findings)} potential plaintext secrets found:")
+            for f in findings[:20]:
+                print(f)
+            if len(findings) > 20:
+                print(f"  ... and {len(findings) - 20} more")
+        else:
+            print("No plaintext secrets found outside vault.")
+
+    elif subcmd == "audit":
+        key_filter = rest[0] if rest else None
+        path = "/audit"
+        if key_filter:
+            path += f"?key={key_filter}"
+        result = _vault_request("GET", path)
+        entries = result.get("entries", result.get("audit", []))
+        if not entries:
+            print("  (no audit entries)")
+            return
+        for e in entries[:20]:
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.get("ts", e.get("created_at", 0))))
+            print(f"  [{ts}] {e.get('action', '?')}: {e.get('key', '?')} by user {e.get('user_id', '?')}")
+
+    else:
+        print(f"Unknown vault command: {subcmd}")
+        print("Commands: list, store, reveal, rotate, check, audit")
+
+
 CAPTURE_DIR = Path("/var/lib/agent-monitor/captures")
 
 
@@ -494,6 +732,7 @@ def main():
         "findings": lambda: cmd_findings(),
         "heartbeat": lambda: cmd_heartbeat(),
         "capture": lambda: cmd_capture(rest),
+        "vault": lambda: cmd_vault(rest),
     }
 
     if cmd in commands:
