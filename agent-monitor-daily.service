@@ -1,0 +1,8 @@
+[Unit]
+Description=Agent Monitor — daily deep security audit
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/agent-monitor/extensions/deep-audit.sh
+TimeoutSec=300

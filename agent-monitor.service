@@ -1,0 +1,8 @@
+[Unit]
+Description=Agent Monitor — plugins + local checks
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/agent-monitor/run-all.sh
+TimeoutSec=120

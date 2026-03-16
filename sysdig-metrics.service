@@ -1,0 +1,8 @@
+[Unit]
+Description=Sysdig metrics collector for Prometheus
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/lgp/sysdig/collect-metrics.sh
+TimeoutSec=30

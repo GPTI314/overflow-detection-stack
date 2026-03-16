@@ -1,0 +1,37 @@
+{
+  "node": "kvm4",
+  "role": "control-plane",
+  "metric_prefix": "kvm4",
+  "collect_interval_sec": 300,
+  "thresholds": {
+    "varlog_size_warn": 524288000,
+    "varlog_size_crit": 1073741824,
+    "varlog_growth_warn": 100000,
+    "varlog_growth_crit": 100000000,
+    "journal_size_warn": 419430400,
+    "journal_size_crit": 524288000,
+    "cpu_warn": 50,
+    "cpu_crit": 80,
+    "mem_warn": 50,
+    "mem_crit": 80,
+    "wg_handshake_stale_sec": 300
+  },
+  "extensions": {
+    "sysdig": true,
+    "docker": true,
+    "wireguard": true,
+    "sovereign_docs": true,
+    "messenger": false,
+    "suricata": false,
+    "crowdsec": false
+  },
+  "watch_dirs": [
+    "/root/kvm4/automagpt/sovereign/",
+    "/opt/lgp/",
+    "/opt/agent-monitor/"
+  ],
+  "critical_services": [
+    "sovereign-docs",
+    "docker"
+  ]
+}
